@@ -1,5 +1,5 @@
 // plugin.js (Main)
-exports.version = 0.4
+exports.version = 0.5
 exports.description = "Ultra lightweight request blocker based on an IP blocklist."
 exports.apiRequired = 4
 exports.repo = "Feuerswut/hfs-ip-blocklist"

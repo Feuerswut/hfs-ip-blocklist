@@ -76,13 +76,26 @@ class PartitionManager {
             const compressed = await fs.readFile(partition.filePath)
             const binary = zlib.inflateSync(compressed)
             
-            // Decode ranges
+            // Decode ranges - MANUAL BYTE READING
             const ranges = []
             for (let i = 0; i < binary.length; i += 8) {
-                ranges.push({
-                    start: binary.readUInt32BE(i),
-                    end: binary.readUInt32BE(i + 4)
-                })
+                // Manually read 4 bytes for start (Big Endian)
+                const start = (
+                    (binary.readUInt8(i) << 24) |
+                    (binary.readUInt8(i + 1) << 16) |
+                    (binary.readUInt8(i + 2) << 8) |
+                    binary.readUInt8(i + 3)
+                ) >>> 0
+                
+                // Manually read 4 bytes for end (Big Endian)
+                const end = (
+                    (binary.readUInt8(i + 4) << 24) |
+                    (binary.readUInt8(i + 5) << 16) |
+                    (binary.readUInt8(i + 6) << 8) |
+                    binary.readUInt8(i + 7)
+                ) >>> 0
+                
+                ranges.push({ start, end })
             }
             
             // Add to cache

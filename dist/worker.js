@@ -201,14 +201,34 @@ async function processBlocklist() {
             const partitionRanges = partitionMap.get(key)
             
             // Sort ranges within partition
-            partitionRanges.sort((a, b) => a.start - b.start)
+            partitionRanges.sort((a, b) => {
+                const aStart = a.start >>> 0
+                const bStart = b.start >>> 0
+                if (aStart < bStart) return -1
+                if (aStart > bStart) return 1
+                return 0
+            })
             
-            // Encode to binary
+            // Encode to binary - manual byte writing to avoid signed/unsigned issues
             const buffer = Buffer.allocUnsafe(partitionRanges.length * 8)
             let offset = 0
+            
             for (const range of partitionRanges) {
-                buffer.writeUInt32BE(range.start, offset)
-                buffer.writeUInt32BE(range.end, offset + 4)
+                const start = range.start >>> 0
+                const end = range.end >>> 0
+                
+                // Manually write 4 bytes for start (Big Endian)
+                buffer.writeUInt8((start >>> 24) & 0xFF, offset)
+                buffer.writeUInt8((start >>> 16) & 0xFF, offset + 1)
+                buffer.writeUInt8((start >>> 8) & 0xFF, offset + 2)
+                buffer.writeUInt8(start & 0xFF, offset + 3)
+                
+                // Manually write 4 bytes for end (Big Endian)
+                buffer.writeUInt8((end >>> 24) & 0xFF, offset + 4)
+                buffer.writeUInt8((end >>> 16) & 0xFF, offset + 5)
+                buffer.writeUInt8((end >>> 8) & 0xFF, offset + 6)
+                buffer.writeUInt8(end & 0xFF, offset + 7)
+                
                 offset += 8
             }
             
