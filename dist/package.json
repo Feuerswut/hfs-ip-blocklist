@@ -1,0 +1,12 @@
+{
+  "name": "hfs-ip-blocklist",
+  "version": "4.0.0",
+  "description": "Ultra-lightweight IP blocklist for Raspberry Pi",
+  "main": "plugin.js",
+  "author": "feuerswut",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/feuerswut/hfs-ip-blocklist"
+  }
+}
