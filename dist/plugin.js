@@ -1,4 +1,4 @@
-exports.version = 0.1
+exports.version = 0.2
 exports.description = "Block requests based on IP blocklist with partitioned storage and LRU caching"
 exports.apiRequired = 4
 exports.repo = "Feuerswut/hfs-ip-blocklist"
@@ -15,7 +15,7 @@ exports.config = {
     source: { 
         type: 'select', 
         defaultValue: 'url',
-        options: ['url', 'file'],
+        options: { 'URL': 'url', 'File': 'file' },
         label: "Blocklist Source"
     },
     url: { 
@@ -57,18 +57,58 @@ exports.config = {
         label: "Compress in Memory",
         helperText: "Use zstd compression for in-memory partitions"
     },
+    enableSoftFail: {
+        type: 'boolean',
+        defaultValue: true,
+        label: "Enable Soft Fail",
+        helperText: "Allow requests if lookup takes longer than timeout"
+    },
+    softFailTimeout: {
+        type: 'number',
+        defaultValue: 50,
+        min: 10,
+        max: 1000,
+        label: "Soft Fail Timeout (ms)",
+        helperText: "Milliseconds to wait before allowing request on cache miss"
+    },
+    logActivePartitions: {
+        type: 'boolean',
+        defaultValue: false,
+        label: "Log Active Partitions",
+        helperText: "Log which partitions are loaded into memory"
+    },
+    logCacheMisses: {
+        type: 'boolean',
+        defaultValue: false,
+        label: "Log Cache Misses",
+        helperText: "Log when a partition needs to be loaded from disk"
+    },
+    logSoftFails: {
+        type: 'boolean',
+        defaultValue: false,
+        label: "Log Soft Fails",
+        helperText: "Log when a request is allowed due to timeout"
+    },
+    logBlocked: {
+        type: 'boolean',
+        defaultValue: true,
+        label: "Log Blocked IPs",
+        helperText: "Log when an IP is blocked"
+    }
 }
 
 exports.init = api => {
-    const storageDir = api.getPluginPath() + '/storage'
+    const storageDir = api.storageDir
     if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true })
 
     let blockList = new Set() // For non-partitioned mode
     let partitionIndex = null // B-tree index for partitioned mode
     let currentHash = null
     let refreshTimer = null
+    let isReady = false // Plugin ready flag
+    let initializationPromise = null
 
-    const {disconnect} = api.require('./connections')
+    const { disconnect } = api.require('./connections')
 
     // Local LAN ranges to exclude
     const LOCAL_RANGES = [
@@ -137,7 +177,6 @@ exports.init = api => {
         
         if (ipv6) {
             const mask = parseInt(bits) || 128
-            // Simplified IPv6 range calculation
             return { start: ipLong, end: ipLong, ipv6: true, cidr }
         } else {
             const mask = parseInt(bits) || 32
@@ -161,6 +200,32 @@ exports.init = api => {
             const ipLong = ip2long(line)
             return { start: ipLong, end: ipLong, ipv6: isIPv6(line) }
         }
+    }
+
+    // Binary search for IP range lookup (PERFORMANCE OPTIMIZATION)
+    function binarySearchRange(ranges, ipLong, ipv6) {
+        let left = 0
+        let right = ranges.length - 1
+        
+        while (left <= right) {
+            const mid = Math.floor((left + right) / 2)
+            const range = ranges[mid]
+            
+            const compareStart = ipv6 ? compareIPv6(ipLong, range.start) : (ipLong - range.start)
+            const compareEnd = ipv6 ? compareIPv6(ipLong, range.end) : (ipLong - range.end)
+            
+            if (compareStart >= 0 && compareEnd <= 0) {
+                return true // IP is in this range
+            }
+            
+            if (compareStart < 0) {
+                right = mid - 1
+            } else {
+                left = mid + 1
+            }
+        }
+        
+        return false
     }
 
     // B-Tree implementation
@@ -242,24 +307,33 @@ exports.init = api => {
     // Partition Manager with LRU cache
     class PartitionManager {
         constructor(maxHotPercent = 20) {
-            this.partitions = new Map() // key -> Partition object
+            this.partitions = new Map()
             this.btree = new BTree()
             this.lruCache = []
             this.maxHotSize = 0
             this.maxHotPercent = maxHotPercent
+            this.stats = { cacheMisses: 0, cacheHits: 0 }
         }
 
         createPartitions(ipv4Ranges, ipv6Ranges) {
             api.log('Creating IPv4 partitions...')
-            const ipv4Partitions = this._partitionByOctet(ipv4Ranges, 8) // /8 partitions
+            const ipv4Partitions = this._partitionByOctet(ipv4Ranges, 8)
             
             api.log('Creating IPv6 partitions...')
-            const ipv6Partitions = this._partitionByPrefix(ipv6Ranges, 32) // /32 partitions
+            const ipv6Partitions = this._partitionByPrefix(ipv6Ranges, 32)
             
             const allPartitions = [...ipv4Partitions, ...ipv6Partitions]
             this.maxHotSize = Math.max(1, Math.ceil(allPartitions.length * this.maxHotPercent / 100))
             
             api.log(`Created ${allPartitions.length} partitions, will keep ${this.maxHotSize} hot`)
+            
+            // Sort ranges within each partition for binary search
+            allPartitions.forEach(p => {
+                p.ranges.sort((a, b) => {
+                    if (p.ipv6) return compareIPv6(b.start, a.start)
+                    return b.start - a.start
+                })
+            })
             
             // Save partitions to disk and index
             allPartitions.forEach(p => this.savePartition(p))
@@ -323,10 +397,20 @@ exports.init = api => {
             if (!partition) return null
             
             if (partition.inMemory) {
+                // Cache hit
+                this.stats.cacheHits++
                 // Update LRU
                 this.lruCache = this.lruCache.filter(k => k !== key)
                 this.lruCache.push(key)
                 return this._getPartitionData(partition)
+            }
+            
+            // Cache miss
+            this.stats.cacheMisses++
+            const config = api.getConfig()
+            
+            if (config.logCacheMisses) {
+                api.log(`Cache miss: loading partition ${key}`)
             }
             
             // Load from disk
@@ -334,7 +418,7 @@ exports.init = api => {
             const data = JSON.parse(zlib.inflateSync(compressed).toString())
             
             // Store in memory
-            if (api.getConfig().compressInMemory) {
+            if (config.compressInMemory) {
                 partition.data = compressed
             } else {
                 partition.data = data
@@ -350,6 +434,10 @@ exports.init = api => {
                     evictPartition.inMemory = false
                     evictPartition.data = null
                 }
+            }
+            
+            if (config.logActivePartitions) {
+                api.log(`Active partitions: ${this.lruCache.join(', ')}`)
             }
             
             return data
@@ -385,12 +473,16 @@ exports.init = api => {
             const ipLong = ip2long(ip)
             const ipv6 = isIPv6(ip)
             
-            return ranges.some(range => {
-                if (ipv6) {
-                    return compareIPv6(ipLong, range.start) >= 0 && compareIPv6(ipLong, range.end) <= 0
-                }
-                return ipLong >= range.start && ipLong <= range.end
-            })
+            // Use binary search for performance
+            return binarySearchRange(ranges, ipLong, ipv6)
+        }
+
+        getStats() {
+            return {
+                ...this.stats,
+                activePartitions: this.lruCache.length,
+                totalPartitions: this.partitions.size
+            }
         }
     }
 
@@ -403,9 +495,17 @@ exports.init = api => {
             let content = ''
             
             if (config.source === 'url') {
+                if (!config.url) {
+                    api.log('ERROR: No URL configured')
+                    return
+                }
                 api.log(`Downloading blocklist from ${config.url}`)
                 content = await downloadFile(config.url)
             } else {
+                if (!config.filePath) {
+                    api.log('ERROR: No file path configured')
+                    return
+                }
                 api.log(`Loading blocklist from ${config.filePath}`)
                 content = fs.readFileSync(config.filePath, 'utf8')
             }
@@ -414,6 +514,10 @@ exports.init = api => {
             const hash = crypto.createHash('sha256').update(content).digest('hex')
             if (hash === currentHash) {
                 api.log('Blocklist unchanged, skipping update')
+                if (!isReady) {
+                    isReady = true
+                    api.log('Plugin is now READY')
+                }
                 return
             }
             
@@ -431,9 +535,8 @@ exports.init = api => {
                 if (!range) continue
                 
                 // Check if local range
-                const testIP = range.ipv6 ? '::1' : '127.0.0.1' // dummy for type check
+                const testIP = range.ipv6 ? '::1' : '127.0.0.1'
                 if (isLocalIP(testIP)) {
-                    // More precise local check
                     const isLocal = LOCAL_RANGES.some(local => {
                         if (local.ipv6 !== range.ipv6) return false
                         if (range.ipv6) {
@@ -459,10 +562,6 @@ exports.init = api => {
             
             api.log(`Parsed ${ipv4Ranges.length} IPv4 and ${ipv6Ranges.length} IPv6 ranges (skipped ${skipped} local)`)
             
-            // Sort descending
-            ipv4Ranges.sort((a, b) => b.start - a.start)
-            ipv6Ranges.sort((a, b) => compareIPv6(b.start, a.start))
-            
             if (config.usePartitions) {
                 // Create partitioned storage
                 partitionManager = new PartitionManager(config.hotPartitionPercent)
@@ -470,7 +569,10 @@ exports.init = api => {
                 blockList.clear()
                 api.log('Partitioned storage ready')
             } else {
-                // Simple in-memory mode
+                // Simple in-memory mode - sort for binary search
+                ipv4Ranges.sort((a, b) => b.start - a.start)
+                ipv6Ranges.sort((a, b) => compareIPv6(b.start, a.start))
+                
                 blockList.clear()
                 ipv4Ranges.forEach(r => blockList.add(JSON.stringify(r)))
                 ipv6Ranges.forEach(r => blockList.add(JSON.stringify(r)))
@@ -478,8 +580,13 @@ exports.init = api => {
                 api.log(`Loaded ${blockList.size} entries in memory`)
             }
             
+            // Mark plugin as ready
+            isReady = true
+            api.log('Plugin is now READY')
+            
         } catch (error) {
-            api.log(`Error loading blocklist: ${error.message}`)
+            api.log(`ERROR loading blocklist: ${error.message}`)
+            api.log(error.stack)
         }
     }
 
@@ -505,26 +612,36 @@ exports.init = api => {
         if (partitionManager) {
             return partitionManager.checkIP(ip)
         } else {
-            // Simple mode: check all ranges
+            // Simple mode: use binary search
             const ipLong = ip2long(ip)
             const ipv6 = isIPv6(ip)
             
-            for (const entry of blockList) {
-                const range = JSON.parse(entry)
-                if (range.ipv6 !== ipv6) continue
-                
-                if (ipv6) {
-                    if (compareIPv6(ipLong, range.start) >= 0 && compareIPv6(ipLong, range.end) <= 0) {
-                        return true
-                    }
-                } else {
-                    if (ipLong >= range.start && ipLong <= range.end) {
-                        return true
-                    }
-                }
-            }
-            return false
+            // Convert set to array for binary search
+            const ranges = Array.from(blockList).map(entry => JSON.parse(entry))
+            const relevantRanges = ranges.filter(r => r.ipv6 === ipv6)
+            
+            return binarySearchRange(relevantRanges, ipLong, ipv6)
         }
+    }
+
+    // Async version with timeout for soft fail
+    async function isBlockedAsync(ip, timeout) {
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                resolve({ blocked: false, softFail: true })
+            }, timeout)
+            
+            // Execute check synchronously but wrap in promise
+            try {
+                const blocked = isBlocked(ip)
+                clearTimeout(timer)
+                resolve({ blocked, softFail: false })
+            } catch (error) {
+                clearTimeout(timer)
+                api.log(`ERROR checking IP ${ip}: ${error.message}`)
+                resolve({ blocked: false, softFail: true, error: true })
+            }
+        })
     }
 
     // Initialize
@@ -542,24 +659,69 @@ exports.init = api => {
         
         // Set up refresh timer
         if (config.refreshInterval > 0) {
-            refreshTimer = setInterval(loadBlocklist, config.refreshInterval * 1000)
+            refreshTimer = setInterval(() => {
+                loadBlocklist().catch(err => {
+                    api.log(`ERROR in refresh timer: ${err.message}`)
+                })
+            }, config.refreshInterval * 1000)
         }
     })
 
-    // Initial load
-    loadBlocklist()
+    // Initial load - store promise so we can await it
+    initializationPromise = loadBlocklist()
 
     return {
-        // CRITICAL: Use frontend_middleware for highest precedence
-        frontend_middleware(ctx) {
-            const ip = ctx.ip
+        middleware: async (ctx) => {
+            // Wait for plugin to be ready
+            if (!isReady) {
+                if (initializationPromise) {
+                    await initializationPromise
+                }
+                // If still not ready after waiting, allow the request
+                if (!isReady) {
+                    return
+                }
+            }
             
-            if (isBlocked(ip)) {
-                api.log(`BLOCKED: ${ip}`)
-                disconnect(ctx, 'IP blocklist')
-                ctx.status = 403
-                ctx.body = 'Forbidden'
-                return true // Stop processing
+            const ip = ctx.ip
+            const config = api.getConfig()
+            
+            // Check if soft fail is enabled
+            if (config.enableSoftFail && config.softFailTimeout > 0) {
+                const { blocked, softFail, error } = await isBlockedAsync(ip, config.softFailTimeout)
+                
+                if (softFail) {
+                    if (config.logSoftFails) {
+                        api.log(`SOFT FAIL: Allowed ${ip} due to timeout${error ? ' (error)' : ''}`)
+                    }
+                    return // Allow request
+                }
+                
+                if (blocked) {
+                    if (config.logBlocked) {
+                        api.log(`BLOCKED: ${ip}`)
+                    }
+                    disconnect(ctx, 'IP blocklist')
+                    ctx.status = 403
+                    ctx.body = 'Forbidden'
+                    return ctx.stop()
+                }
+            } else {
+                // Synchronous check without soft fail
+                try {
+                    if (isBlocked(ip)) {
+                        if (config.logBlocked) {
+                            api.log(`BLOCKED: ${ip}`)
+                        }
+                        disconnect(ctx, 'IP blocklist')
+                        ctx.status = 403
+                        ctx.body = 'Forbidden'
+                        return ctx.stop()
+                    }
+                } catch (error) {
+                    api.log(`ERROR checking IP ${ip}: ${error.message}`)
+                    // On error, allow the request
+                }
             }
         },
         
@@ -567,6 +729,14 @@ exports.init = api => {
             if (refreshTimer) {
                 clearInterval(refreshTimer)
             }
+            
+            // Log final stats
+            if (partitionManager) {
+                const stats = partitionManager.getStats()
+                api.log(`Final stats - Cache hits: ${stats.cacheHits}, misses: ${stats.cacheMisses}, ` +
+                       `active: ${stats.activePartitions}/${stats.totalPartitions}`)
+            }
+            
             api.log('IP Blocker unloaded')
         }
     }
