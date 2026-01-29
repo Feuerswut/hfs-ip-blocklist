@@ -1,6 +1,6 @@
 {
   "name": "hfs-ip-blocklist",
-  "version": "4.0.0",
+  "version": "0.5",
   "description": "Ultra-lightweight IP blocklist for Raspberry Pi",
   "main": "plugin.js",
   "author": "feuerswut",
