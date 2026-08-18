@@ -2,7 +2,7 @@
 // DEPRECATED: merged into security-suite (https://github.com/feuerswut/security-suite).
 // This plugin will not receive further updates; only security-suite is maintained.
 
-exports.version = 0.6
+exports.version = 3
 exports.description = "Ultra lightweight request blocker based on an IP blocklist."
 exports.apiRequired = 4
 exports.repo = "feuerswut/hfs-ip-blocklist"
@@ -17,7 +17,7 @@ exports.config = {
         type: 'show_html',
         html: '<div style="background:#402020;border:1px solid #a33;border-radius:6px;padding:10px 14px;margin-bottom:1em">'
             + '<strong>Deprecated</strong> &mdash; this plugin has been merged into '
-            + '<a href="https://github.com/feuerswut/security-suite" target="_blank" rel="noopener">security-suite</a>. '
+            + '<a href="https://github.com/feuerswut/hfs-security-suite" target="_blank" rel="noopener">security-suite</a>. '
             + 'It will not receive further updates; only security-suite is maintained going forward.'
             + '</div>',
     },
